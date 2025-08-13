@@ -1,0 +1,12 @@
+- [ ] runtime.txt is set to python-3.10
+- [ ] requirements installed without errors
+- [ ] OPENAI_API_KEY configured as environment secret (not committed)
+- [ ] App runs locally with `python app.py`
+- [ ] Uploading a sample X-ray returns predictions, Grad-CAM overlay, and Thai explanation
+- [ ] No API keys printed in logs/UI
+- [ ] Tests pass: `pytest -q`
+- [ ] Space created on Hugging Face with hardware set (CPU/GPU)
+- [ ] Secrets configured in Space: OPENAI_API_KEY
+- [ ] Weights added via relative path or HF Hub ID (not committed)
+- [ ] README updated with any custom weight paths or models
+

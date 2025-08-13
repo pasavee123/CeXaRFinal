@@ -1,0 +1,119 @@
+# CeXaR: .gitignore สำหรับโปรเจกต์ Python + Gradio + PyTorch
+
+# -----------------------------
+# Python
+# -----------------------------
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# -----------------------------
+# Build / Packaging
+# -----------------------------
+build/
+dist/
+wheels/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+MANIFEST
+
+# -----------------------------
+# Installer logs
+# -----------------------------
+pip-log.txt
+pip-delete-this-directory.txt
+
+# -----------------------------
+# Testing / Coverage
+# -----------------------------
+.pytest_cache/
+.coverage
+.coverage.*
+.cache/
+nosetests.xml
+coverage.xml
+htmlcov/
+
+# -----------------------------
+# Jupyter
+# -----------------------------
+.ipynb_checkpoints/
+
+# -----------------------------
+# Type checkers
+# -----------------------------
+.mypy_cache/
+.pytype/
+.pyre/
+
+# -----------------------------
+# Virtual Environments
+# -----------------------------
+.venv/
+venv/
+ENV/
+env/
+
+# -----------------------------
+# Environment Variables
+# -----------------------------
+# ป้องกันการรั่วไหลของคีย์/ความลับ (เช่น OPENAI_API_KEY)
+.env
+.env.*
+.env.local
+.env.*.local
+
+# -----------------------------
+# Model Weights (Local only)
+# -----------------------------
+# ไม่ควรคอมมิตน้ำหนักโมเดลขนาดใหญ่เข้า Git
+models/weights/*
+!models/weights/.gitkeep
+
+# -----------------------------
+# Logs / Temp files
+# -----------------------------
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+
+# -----------------------------
+# IDE / Editor
+# -----------------------------
+.vscode/
+.idea/
+*.code-workspace
+
+# -----------------------------
+# OS-specific
+# -----------------------------
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+# Linux
+.Trash-*
+
+__pycache__/
+.pytest_cache/
+*.pyc
+.env
+models/weights/
+*.pt
+*.pth
+*.ckpt
+*.bin
+*.safetensors
+dist/
+build/
+.DS_Store
+*.egg-info/
+
