@@ -23,6 +23,65 @@ except Exception:  # pragma: no cover
 logger = logging.getLogger(__name__)
 
 
+def _ensure_dependency_stubs() -> None:
+    """Provide lightweight stubs for optional EVA-X deps when unavailable.
+
+    - apex.normalization.FusedLayerNorm -> torch.nn.LayerNorm
+    - xformers.ops.memory_efficient_attention -> naive attention fallback
+    """
+    # Stub apex.normalization.FusedLayerNorm
+    try:
+        import apex  # type: ignore
+        from apex.normalization import FusedLayerNorm as _FLN  # noqa: F401
+    except Exception:
+        import types
+        apex_mod = types.ModuleType("apex")
+        normalization_mod = types.ModuleType("apex.normalization")
+
+        class FusedLayerNorm(nn.LayerNorm):
+            pass
+
+        normalization_mod.FusedLayerNorm = FusedLayerNorm
+        apex_mod.normalization = normalization_mod  # type: ignore[attr-defined]
+        sys.modules.setdefault("apex", apex_mod)
+        sys.modules.setdefault("apex.normalization", normalization_mod)
+
+    # Stub xformers.ops.memory_efficient_attention
+    try:
+        import xformers.ops as _xops  # type: ignore # noqa: F401
+    except Exception:
+        import types
+        xops_mod = types.ModuleType("xformers.ops")
+
+        def memory_efficient_attention(q, k, v):
+            # q,k,v shapes: [B, N, H, C] or [B, H, N, C] depending on caller; EVA uses [B, N, num_heads, C]
+            if q.dim() == 4 and q.shape[1] != q.shape[2]:
+                # assume [B, N, H, C]
+                B, N, H, C = q.shape
+                q_ = q.permute(0, 2, 1, 3).reshape(B * H, N, C)
+                k_ = k.permute(0, 2, 1, 3).reshape(B * H, N, C)
+                v_ = v.permute(0, 2, 1, 3).reshape(B * H, N, C)
+                attn = torch.softmax((q_ @ k_.transpose(-2, -1)) / (C ** 0.5), dim=-1)
+                out = attn @ v_
+                out = out.reshape(B, H, N, C).permute(0, 2, 1, 3).contiguous()
+                out = out.view(B, N, H * C)
+                return out
+            else:
+                # assume [B, H, N, C]
+                B, H, N, C = q.shape
+                q_ = q.reshape(B * H, N, C)
+                k_ = k.reshape(B * H, N, C)
+                v_ = v.reshape(B * H, N, C)
+                attn = torch.softmax((q_ @ k_.transpose(-2, -1)) / (C ** 0.5), dim=-1)
+                out = attn @ v_
+                out = out.reshape(B, H, N, C)
+                out = out.permute(0, 2, 1, 3).contiguous().view(B, N, H * C)
+                return out
+
+        xops_mod.memory_efficient_attention = memory_efficient_attention
+        sys.modules.setdefault("xformers.ops", xops_mod)
+
+
 def _get_preprocess_fn(model_name: str, input_size: int = 224) -> Callable[[Image.Image], torch.Tensor]:
     mean = (0.49185243, 0.49185243, 0.49185243)
     std = (0.28509309, 0.28509309, 0.28509309)
@@ -125,6 +184,7 @@ def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Call
 
     # Try to build real EVA-X model
     model: nn.Module
+    _ensure_dependency_stubs()
     factory = _import_eva_x_factory()
     if factory is not None:
         try:

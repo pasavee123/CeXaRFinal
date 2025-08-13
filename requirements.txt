@@ -5,10 +5,11 @@ numpy==1.26.4
 Pillow==10.3.0
 opencv-python-headless==4.10.0.84
 matplotlib==3.9.1
-grad-cam==1.5.5
+pytorch-grad-cam==1.5.5
 huggingface-hub==0.24.6
 python-dotenv==1.0.1
 requests==2.32.3
 tenacity==9.0.0
 pytest==8.3.2
+timm==0.9.16
 
