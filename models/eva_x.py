@@ -94,12 +94,31 @@ def _get_preprocess_fn(model_name: str, input_size: int = 224) -> Callable[[Imag
     return transform
 
 
-def _get_label_map() -> List[str]:
+def _get_label_map_default16() -> List[str]:
+    # 16-class extension for demo
     return [
         "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration", "Mass", "Nodule",
         "Pneumonia", "Pneumothorax", "Consolidation", "Edema", "Emphysema", "Fibrosis",
         "Pleural_Thickening", "Hernia", "Fracture", "Lesion"
     ]
+
+
+def _get_label_map_chexpert14() -> List[str]:
+    # Common CheXpert/ChestX-ray14 label set (14 classes)
+    return [
+        "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration", "Mass", "Nodule",
+        "Pneumonia", "Pneumothorax", "Consolidation", "Edema", "Emphysema", "Fibrosis",
+        "Pleural_Thickening", "Hernia"
+    ]
+
+
+def _get_label_map_by_count(num_classes: int) -> List[str]:
+    if num_classes == 14:
+        return _get_label_map_chexpert14()
+    if num_classes == 16:
+        return _get_label_map_default16()
+    # Fallback: create generic labels
+    return [f"Class_{i}" for i in range(num_classes)]
 
 
 def _download_checkpoint(model_name: str) -> Optional[str]:
@@ -180,7 +199,7 @@ class _FallbackClassifier(nn.Module):
 
 def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Callable[[Image.Image], torch.Tensor], List[str]]:
     device_t = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
-    label_map = _get_label_map()
+    label_map = _get_label_map_default16()
 
     # Try to build real EVA-X model
     model: nn.Module
@@ -188,7 +207,8 @@ def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Call
     factory = _import_eva_x_factory()
     if factory is not None:
         try:
-            model = factory(pretrained=False, num_classes=len(label_map))
+            # Instantiate with neutral head; we'll reset to checkpoint classes after reading weights
+            model = factory(pretrained=False, num_classes=0)
             logger.info("Initialized real EVA-X model via %s", factory.__name__)
         except Exception as e:
             logger.warning("EVA-X factory instantiation failed (%s). Falling back to small CNN.", e)
@@ -207,6 +227,22 @@ def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Call
                 state = state["model"]
             elif "state_dict" in state and isinstance(state["state_dict"], dict):
                 state = state["state_dict"]
+        # Try inferring classifier size from checkpoint and reset head accordingly (for EVA-X VisionTransformer)
+        num_classes_from_ckpt: Optional[int] = None
+        if isinstance(state, dict):
+            hw = state.get("head.weight")
+            hb = state.get("head.bias")
+            if isinstance(hw, torch.Tensor):
+                num_classes_from_ckpt = int(hw.shape[0])
+            elif isinstance(hb, torch.Tensor):
+                num_classes_from_ckpt = int(hb.shape[0])
+        if num_classes_from_ckpt is not None and hasattr(model, "reset_classifier"):
+            try:
+                model.reset_classifier(num_classes_from_ckpt)
+                label_map = _get_label_map_by_count(num_classes_from_ckpt)
+                logger.info("Reset classifier to %d classes inferred from checkpoint.", num_classes_from_ckpt)
+            except Exception:
+                logger.warning("Failed to reset classifier to %d; continuing.", num_classes_from_ckpt)
         try:
             missing, unexpected = model.load_state_dict(state, strict=False)
             logger.info("Loaded EVA-X weights: missing=%s unexpected=%s", missing, unexpected)
@@ -229,7 +265,15 @@ def analyze_image(model: nn.Module, preprocess_fn: Callable[[Image.Image], torch
     probs_np = probs.detach().cpu().numpy()
     logits_np = logits.detach().cpu().numpy()[0]
 
-    label_map = _get_label_map()
+    # Use current label_map length from classifier if it matches known sets
+    # We cannot access label_map here directly; rebuild based on classifier head if possible
+    num_classes = logits.shape[-1]
+    if num_classes == 14:
+        label_map = _get_label_map_chexpert14()
+    elif num_classes == 16:
+        label_map = _get_label_map_default16()
+    else:
+        label_map = [f"Class_{i}" for i in range(num_classes)]
     results: List[Dict[str, float]] = []
     for label, p, l in zip(label_map, probs_np.tolist(), logits_np.tolist()):
         results.append({"label": label, "confidence": float(p), "logit": float(l)})
