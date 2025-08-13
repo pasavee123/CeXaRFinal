@@ -1,3 +1,10 @@
+---
+title: CeXaR
+sdk: gradio
+app_file: app.py
+license: mit
+---
+
 CeXaR — Chest X-ray Analyzer + LLM Explanation
 
 Overview
