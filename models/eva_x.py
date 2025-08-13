@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import os
+import sys
 import logging
+import importlib.util
+from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Optional
 
 import numpy as np
@@ -10,47 +13,19 @@ import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
-from huggingface_hub import snapshot_download, hf_hub_download
+from huggingface_hub import hf_hub_download
 
 try:
     from pytorch_grad_cam import GradCAM
-    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
-    from pytorch_grad_cam.utils.image import show_cam_on_image
 except Exception:  # pragma: no cover
     GradCAM = None
 
 logger = logging.getLogger(__name__)
 
 
-# Minimal EVA-X like ViT head for demo; accepts external weights.
-class SimpleViTClassifier(nn.Module):
-    def __init__(self, num_classes: int = 16, img_size: int = 224):
-        super().__init__()
-        self.img_size = img_size
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.classifier = nn.Linear(128, num_classes)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = torch.flatten(x, 1)
-        x = self.classifier(x)
-        return x
-
-
 def _get_preprocess_fn(model_name: str, input_size: int = 224) -> Callable[[Image.Image], torch.Tensor]:
-    # From EVA-X classification/utils/datasets.py build_transform mean/std for 'eva' models
-    # mean=(0.49185243, 0.49185243, 0.49185243), std=(0.28509309, 0.28509309, 0.28509309)
     mean = (0.49185243, 0.49185243, 0.49185243)
     std = (0.28509309, 0.28509309, 0.28509309)
-
     transform = transforms.Compose([
         transforms.Resize(int(256), interpolation=Image.BICUBIC),
         transforms.CenterCrop(input_size),
@@ -61,7 +36,6 @@ def _get_preprocess_fn(model_name: str, input_size: int = 224) -> Callable[[Imag
 
 
 def _get_label_map() -> List[str]:
-    # 16-class mapping seen across EVA-X configs (interpolate14to16 implies 16). Provide common ChestX-ray14 labels + 2 extras.
     return [
         "Atelectasis", "Cardiomegaly", "Effusion", "Infiltration", "Mass", "Nodule",
         "Pneumonia", "Pneumothorax", "Consolidation", "Edema", "Emphysema", "Fibrosis",
@@ -69,61 +43,119 @@ def _get_label_map() -> List[str]:
     ]
 
 
-def _load_weights_into_model(model: nn.Module, model_name: str, map_location: Optional[torch.device] = None) -> None:
+def _download_checkpoint(model_name: str) -> Optional[str]:
     if model_name in (None, "", "local"):
-        logger.info("Using randomly initialized demo weights.")
-        return
-
-    ckpt_path: Optional[str] = None
+        return None
     if os.path.isfile(model_name):
-        ckpt_path = model_name
-    else:
+        return model_name
+    # Support explicit file inside HF repo: "repo_id:filename"
+    if ":" in model_name:
+        repo_id, filename = model_name.split(":", 1)
+        logger.info("Downloading specific file from hub: %s (%s)", repo_id, filename)
+        return hf_hub_download(repo_id=repo_id, filename=filename)
+    # Otherwise, try common filenames
+    try:
+        return hf_hub_download(repo_id=model_name, filename="pytorch_model.bin")
+    except Exception:
         try:
-            ckpt_path = hf_hub_download(repo_id=model_name, filename="pytorch_model.bin")
-        except Exception:
-            try:
-                ckpt_path = hf_hub_download(repo_id=model_name, filename="model.pth")
-            except Exception as e:
-                logger.warning("Failed to download weights from hub: %s", e)
+            return hf_hub_download(repo_id=model_name, filename="model.pth")
+        except Exception as e:
+            logger.warning("Failed to download weights from hub: %s", e)
+            return None
 
-    if ckpt_path and os.path.isfile(ckpt_path):
-        state = torch.load(ckpt_path, map_location=map_location or "cpu")
-        if "state_dict" in state:
-            state = state["state_dict"]
-        missing, unexpected = model.load_state_dict(state, strict=False)
-        logger.info("Loaded weights: missing=%s unexpected=%s", missing, unexpected)
-    else:
-        logger.info("Weights not provided; using random init.")
+
+def _import_eva_x_factory() -> Optional[Callable[..., nn.Module]]:
+    """Dynamically import EVA-X classification model factory from reference repo.
+
+    Returns a callable like `eva02_small_patch16_xattn_fusedLN_SwiGLU_preln_RoPE` if available,
+    else None.
+    """
+    repo_root = Path(__file__).resolve().parents[1]  # project root
+    eva_cls_path = repo_root / "EVA-X[repo]" / "classification" / "models" / "models_eva.py"
+    if not eva_cls_path.exists():
+        logger.warning("EVA-X reference model file not found at %s", str(eva_cls_path))
+        return None
+
+    try:
+        spec = importlib.util.spec_from_file_location("eva_models_local", str(eva_cls_path))
+        if spec is None or spec.loader is None:
+            logger.warning("Failed to load EVA-X spec from %s", str(eva_cls_path))
+            return None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)  # type: ignore[attr-defined]
+        # Prefer small patch16 architecture used by provided checkpoints
+        factory_name = "eva02_small_patch16_xattn_fusedLN_SwiGLU_preln_RoPE"
+        if hasattr(module, factory_name):
+            return getattr(module, factory_name)
+        # Fallbacks
+        for name in (
+            "eva02_base_patch16_xattn_fusedLN_NaiveSwiGLU_subln_RoPE",
+            "eva02_tiny_patch16_xattn_fusedLN_SwiGLU_preln_RoPE",
+        ):
+            if hasattr(module, name):
+                return getattr(module, name)
+        logger.warning("No suitable EVA-X factory found in module %s", eva_cls_path.name)
+        return None
+    except Exception as e:
+        logger.warning("Failed to import EVA-X model due to: %s", e)
+        return None
+
+
+class _FallbackClassifier(nn.Module):
+    def __init__(self, num_classes: int = 16):
+        super().__init__()
+        self.features = nn.Sequential(
+            nn.Conv2d(3, 32, 3, 2, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+        )
+        self.classifier = nn.Linear(128, num_classes)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.features(x)
+        x = torch.flatten(x, 1)
+        return self.classifier(x)
 
 
 def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Callable[[Image.Image], torch.Tensor], List[str]]:
-    """Create model, preprocessing, and label map.
-
-    - Supports local weight path or HF Hub ID via model_name.
-    - Uses EVA-X preprocessing stats.
-    """
     device_t = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
     label_map = _get_label_map()
-    model = SimpleViTClassifier(num_classes=len(label_map), img_size=224)
 
-    # New convention: "repo_id:filename" targets a specific file inside a HF repo
-    if model_name not in (None, "", "local") and ":" in model_name and not os.path.isfile(model_name):
+    # Try to build real EVA-X model
+    model: nn.Module
+    factory = _import_eva_x_factory()
+    if factory is not None:
         try:
-            repo_id, filename = model_name.split(":", 1)
-            logger.info("Downloading specific file from hub: %s (%s)", repo_id, filename)
-            ckpt_path = hf_hub_download(repo_id=repo_id, filename=filename)
-            state = torch.load(ckpt_path, map_location=device_t)
-            if isinstance(state, dict) and "state_dict" in state:
-                state = state["state_dict"]
-            missing, unexpected = model.load_state_dict(state, strict=False)
-            logger.info("Loaded weights (explicit file): missing=%s unexpected=%s", missing, unexpected)
+            model = factory(pretrained=False, num_classes=len(label_map))
+            logger.info("Initialized real EVA-X model via %s", factory.__name__)
         except Exception as e:
-            logger.warning("Explicit HF file download failed (%s). Falling back to default loader.", e)
-            _load_weights_into_model(model, model_name, map_location=device_t)
+            logger.warning("EVA-X factory instantiation failed (%s). Falling back to small CNN.", e)
+            model = _FallbackClassifier(num_classes=len(label_map))
     else:
-        _load_weights_into_model(model, model_name, map_location=device_t)
-    model.eval().to(device_t)
+        model = _FallbackClassifier(num_classes=len(label_map))
+        logger.warning("Using fallback classifier as EVA-X import was unavailable.")
 
+    # Load checkpoint
+    ckpt_path = _download_checkpoint(model_name)
+    if ckpt_path is not None and os.path.isfile(ckpt_path):
+        state = torch.load(ckpt_path, map_location=device_t)
+        # Common containers: {"model": ...}, {"state_dict": ...}
+        if isinstance(state, dict):
+            if "model" in state and isinstance(state["model"], dict):
+                state = state["model"]
+            elif "state_dict" in state and isinstance(state["state_dict"], dict):
+                state = state["state_dict"]
+        try:
+            missing, unexpected = model.load_state_dict(state, strict=False)
+            logger.info("Loaded EVA-X weights: missing=%s unexpected=%s", missing, unexpected)
+        except Exception as e:
+            logger.warning("Failed to load EVA-X checkpoint (%s). Using randomly initialized weights.", e)
+    else:
+        logger.info("No checkpoint provided; using randomly initialized weights.")
+
+    model.eval().to(device_t)
     preprocess_fn = _get_preprocess_fn(model_name, input_size=224)
     return model, preprocess_fn, label_map
 
@@ -147,24 +179,23 @@ def analyze_image(model: nn.Module, preprocess_fn: Callable[[Image.Image], torch
 
 def get_gradcam_heatmap(model: nn.Module, target_layer, image_tensor: torch.Tensor) -> np.ndarray:
     device = next(model.parameters()).device
+    # For ViT-based EVA-X, GradCAM conv target may not exist; fallback to simple input-grad saliency
     if GradCAM is None:
-        # Fallback simple saliency via absolute gradients norm over input
         image_tensor = image_tensor.requires_grad_(True)
         scores = model(image_tensor)
         top_idx = scores.sigmoid().mean(dim=1).argmax()
         scores[:, top_idx].backward()
-        grads = image_tensor.grad.detach().abs().mean(dim=1, keepdim=True)  # Bx1xHxW
+        grads = image_tensor.grad.detach().abs().mean(dim=1, keepdim=True)
         heatmap = grads[0, 0]
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-6)
         return heatmap.cpu().numpy()
 
-    # Try to pick a convolutional layer inside model.features for CAM
+    # Try to find a conv layer; if not found, use last module
     last_conv = None
-    if hasattr(model, "features"):
-        for m in reversed(model.features):
-            if isinstance(m, nn.Conv2d):
-                last_conv = m
-                break
+    for m in reversed(list(model.modules())):
+        if isinstance(m, nn.Conv2d):
+            last_conv = m
+            break
     target_layers = [last_conv] if last_conv is not None else [list(model.children())[-1]]
 
     with GradCAM(model=model, target_layers=target_layers, use_cuda=(device.type == "cuda")) as cam:
