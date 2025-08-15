@@ -16,6 +16,7 @@ from PIL import Image
 from torchvision import transforms
 from huggingface_hub import hf_hub_download
 import timm
+import types
 
 try:
     from pytorch_grad_cam import GradCAM
@@ -146,27 +147,79 @@ def _download_checkpoint(model_name: str) -> Optional[str]:
 
 def _register_eva_x_models() -> bool:
     """Register EVA-X models with timm registry by importing models_eva.py.
-    
+
     Returns True if successful, False otherwise.
     """
     repo_root = Path(__file__).resolve().parents[1]  # project root
     eva_cls_path = repo_root / "EVA-X[repo]" / "classification" / "models" / "models_eva.py"
+    rope_path = repo_root / "EVA-X[repo]" / "classification" / "models" / "rope.py"
+    
+    logger.info("Checking EVA-X paths:")
+    logger.info("  Repo root: %s", repo_root)
+    logger.info("  models_eva.py: %s (exists: %s)", eva_cls_path, eva_cls_path.exists())
+    logger.info("  rope.py: %s (exists: %s)", rope_path, rope_path.exists())
+    
     if not eva_cls_path.exists():
-        logger.warning("EVA-X reference model file not found at %s", str(eva_cls_path))
+        logger.error("EVA-X reference model file not found at %s", str(eva_cls_path))
+        logger.error("Please ensure EVA-X[repo] directory structure is intact")
+        return False
+    
+    if not rope_path.exists():
+        logger.error("EVA-X rope module not found at %s", str(rope_path))
         return False
 
     try:
-        spec = importlib.util.spec_from_file_location("eva_models_registry", str(eva_cls_path))
-        if spec is None or spec.loader is None:
-            logger.warning("Failed to load EVA-X spec from %s", str(eva_cls_path))
-            return False
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = module
-        spec.loader.exec_module(module)  # type: ignore[attr-defined]
-        logger.info("Successfully registered EVA-X models with timm registry")
-        return True
+        # Ensure stubs are available before importing EVA-X
+        _ensure_dependency_stubs()
+        
+        # Import EVA-X models using direct module loading
+        eva_models_dir = str(eva_cls_path.parent)
+        eva_classification_dir = str(eva_cls_path.parent.parent)
+        
+        # Add necessary paths to sys.path
+        original_path = sys.path.copy()
+        sys.path.insert(0, eva_models_dir)
+        sys.path.insert(0, eva_classification_dir)
+        
+        try:
+            # Read and execute rope module first
+            rope_code = rope_path.read_text(encoding='utf-8')
+            rope_module = types.ModuleType("rope")
+            exec(rope_code, rope_module.__dict__)
+            sys.modules["rope"] = rope_module
+            logger.info("Successfully loaded rope module")
+            
+            # Read and modify models_eva to handle imports
+            eva_code = eva_cls_path.read_text(encoding='utf-8')
+            
+            # Replace relative imports
+            eva_code = eva_code.replace("from .rope import *", "from rope import *")
+            
+            # Create module and execute
+            eva_module = types.ModuleType("models_eva_custom")
+            eva_module.__file__ = str(eva_cls_path)
+            eva_module.__dict__['rope'] = rope_module
+            
+            # Copy rope module contents to eva_module namespace
+            for name in dir(rope_module):
+                if not name.startswith('_'):
+                    eva_module.__dict__[name] = getattr(rope_module, name)
+            
+            # Execute the modified code
+            exec(eva_code, eva_module.__dict__)
+            sys.modules["models_eva_custom"] = eva_module
+            
+            logger.info("Successfully registered EVA-X models with timm registry")
+            return True
+            
+        finally:
+            # Restore original sys.path
+            sys.path[:] = original_path
+            
     except Exception as e:
-        logger.warning("Failed to import EVA-X models: %s", e)
+        logger.error("Failed to import EVA-X models: %s", e)
+        import traceback
+        logger.error("Full traceback: %s", traceback.format_exc())
         return False
 
 
@@ -193,15 +246,16 @@ def _get_model_name_from_path(model_path: str) -> str:
 def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Callable[[Image.Image], torch.Tensor], List[str]]:
     """Create EVA-X model using timm registry - the correct EVA-X approach."""
     device_t = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
-    
+
     # Setup dependency stubs
     _ensure_dependency_stubs()
     
-    # Register EVA-X models with timm
-    if not _register_eva_x_models():
+    # Register EVA-X models with timm - REQUIRED
+    eva_registration_success = _register_eva_x_models()
+    if not eva_registration_success:
         raise RuntimeError(
-            "EVA-X model registration failed. Please ensure EVA-X[repo]/classification/models/models_eva.py exists. "
-            "This medical application requires authentic EVA-X models for reliable diagnosis."
+            "EVA-X model registration failed. This medical application requires authentic EVA-X models. "
+            "Please ensure EVA-X[repo]/classification/models/models_eva.py exists and all dependencies are installed."
         )
     
     # Download and verify checkpoint
@@ -213,22 +267,22 @@ def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Call
         )
     
     # Load checkpoint to determine architecture and classes
-    state = torch.load(ckpt_path, map_location=device_t)
-    if isinstance(state, dict):
-        if "model" in state and isinstance(state["model"], dict):
-            state = state["model"]
-        elif "state_dict" in state and isinstance(state["state_dict"], dict):
-            state = state["state_dict"]
+        state = torch.load(ckpt_path, map_location=device_t)
+        if isinstance(state, dict):
+            if "model" in state and isinstance(state["model"], dict):
+                state = state["model"]
+            elif "state_dict" in state and isinstance(state["state_dict"], dict):
+                state = state["state_dict"]
     
     # Determine number of classes from checkpoint
-    num_classes_from_ckpt: Optional[int] = None
-    if isinstance(state, dict):
-        hw = state.get("head.weight")
-        hb = state.get("head.bias")
-        if isinstance(hw, torch.Tensor):
-            num_classes_from_ckpt = int(hw.shape[0])
-        elif isinstance(hb, torch.Tensor):
-            num_classes_from_ckpt = int(hb.shape[0])
+        num_classes_from_ckpt: Optional[int] = None
+        if isinstance(state, dict):
+            hw = state.get("head.weight")
+            hb = state.get("head.bias")
+            if isinstance(hw, torch.Tensor):
+                num_classes_from_ckpt = int(hw.shape[0])
+            elif isinstance(hb, torch.Tensor):
+                num_classes_from_ckpt = int(hb.shape[0])
     
     if num_classes_from_ckpt is None:
         raise RuntimeError("Cannot determine number of classes from checkpoint. Invalid model file.")
@@ -236,7 +290,7 @@ def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Call
     # Determine model architecture from path
     model_arch = _get_model_name_from_path(model_name)
     
-    # Create model using timm - the correct EVA-X way
+    # Create model using timm - MUST be authentic EVA-X
     try:
         model = timm.create_model(
             model_arch,
@@ -247,9 +301,13 @@ def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Call
             drop_path_rate=0.0,
             attn_drop_rate=0.0,
         )
-        logger.info("Created EVA-X model (%s) with %d classes using timm", model_arch, num_classes_from_ckpt)
+        logger.info("Successfully created authentic EVA-X model (%s) with %d classes", model_arch, num_classes_from_ckpt)
     except Exception as e:
-        raise RuntimeError(f"Failed to create EVA-X model via timm: {e}")
+        raise RuntimeError(
+            f"Failed to create EVA-X model ({model_arch}): {e}. "
+            f"This medical application requires authentic EVA-X models only. "
+            f"Please ensure EVA-X[repo] is properly installed and all dependencies are available."
+        )
     
     # Load weights
     try:
@@ -262,7 +320,7 @@ def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Call
     
     # Setup label mapping
     label_map = _get_label_map_by_count(num_classes_from_ckpt)
-    
+
     model.eval().to(device_t)
     preprocess_fn = _get_preprocess_fn(model_name, input_size=224)
     return model, preprocess_fn, label_map
@@ -341,11 +399,11 @@ def get_gradcam_heatmap(model: nn.Module, target_layer, image_tensor: torch.Tens
         target_layers = [list(model.children())[-1]]
     
     try:
-        with GradCAM(model=model, target_layers=target_layers, use_cuda=(device.type == "cuda")) as cam:
-            grayscale_cam = cam(input_tensor=image_tensor, targets=None)
-            heatmap = grayscale_cam[0]
-            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-6)
-            return heatmap
+    with GradCAM(model=model, target_layers=target_layers, use_cuda=(device.type == "cuda")) as cam:
+        grayscale_cam = cam(input_tensor=image_tensor, targets=None)
+        heatmap = grayscale_cam[0]
+        heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-6)
+        return heatmap
     except Exception as e:
         logger.warning("GradCAM failed with error: %s. Using gradient saliency fallback.", e)
         # Fallback to simple gradient method

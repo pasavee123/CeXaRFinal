@@ -33,13 +33,13 @@ Project Structure
 - `test/`: Pytest unit tests and tiny fixtures.
 - `EVA-X[repo]/`: Complete EVA-X reference repository for model architecture.
 
-## ⚠️ Important Changes
-**No Fallback Models**: This application now requires authentic trained EVA-X weights. It will fail gracefully with clear error messages if:
-- Model weights are not found
-- EVA-X architecture cannot be imported
-- Invalid checkpoint files are provided
+## ⚠️ Critical Requirements
+**AUTHENTIC EVA-X ONLY**: This medical application requires authentic EVA-X models and will FAIL if:
+- EVA-X repository structure is incomplete (`EVA-X[repo]/classification/models/`)
+- Model weights are not found or invalid  
+- EVA-X dependencies are missing (timm, torch, etc.)
 
-This ensures medical diagnosis reliability by preventing the use of untrained or inappropriate models.
+**NO FALLBACK MODELS** - System will error immediately to ensure medical diagnosis reliability.
 
 ## 🚀 Performance Improvements
 - **Model Caching**: Models are cached using `@lru_cache` to avoid reloading on each request

@@ -23,8 +23,15 @@
 - [ ] README updated with required model weights and deployment notes
 - [ ] Error handling tested (app fails gracefully without valid weights)
 
-### ⚠️ Critical Notes
-- **No Fallback Models**: App will intentionally fail without authentic EVA-X weights
-- **Medical Reliability**: Only trained models should be used for medical diagnosis
+### ⚠️ CRITICAL REQUIREMENTS
+- **AUTHENTIC EVA-X ONLY**: App will FAIL without genuine EVA-X models - NO EXCEPTIONS
+- **Repository Structure Required**: EVA-X[repo]/classification/models/ must be complete
+- **Medical Safety**: Zero tolerance for fallback models in medical diagnosis
 - **Performance**: Model caching reduces inference time significantly
+
+### 🚨 FAILURE CONDITIONS (By Design)
+- Missing EVA-X repository files → IMMEDIATE FAILURE
+- Invalid/missing model weights → IMMEDIATE FAILURE  
+- EVA-X import errors → IMMEDIATE FAILURE
+- This ensures medical-grade reliability
 
