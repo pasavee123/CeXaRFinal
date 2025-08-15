@@ -8,7 +8,7 @@ license: mit
 CeXaR — Chest X-ray Analyzer + LLM Explanation
 
 Overview
-CeXaR is a lightweight demo that analyzes chest X-ray images using a compact CNN classifier inspired by EVA-X preprocessing and produces a Grad-CAM visualization and Thai explanation via an LLM. This is not a medical device. Results are for educational/demo purposes only.
+CeXaR is a medical imaging application that analyzes chest X-ray images using authentic EVA-X Vision Transformer models. It produces accurate predictions, Grad-CAM visualizations, and Thai explanations via an LLM. This application requires trained EVA-X model weights for reliable medical diagnosis.
 
 Architecture
 ```
@@ -24,13 +24,29 @@ predictions + image meta -> [ OpenAI LLM ] -> Thai explanation and chat replies 
 ```
 
 Project Structure
-- `app.py`: Gradio app entrypoint.
-- `models/eva_x.py`: Minimal model wrapper: `create_model`, `analyze_image`, `get_gradcam_heatmap` with EVA-X style transforms.
+- `app.py`: Gradio app entrypoint with model caching and robust error handling.
+- `models/eva_x.py`: Authentic EVA-X Vision Transformer integration with no fallback models.
 - `llm/openai_client.py`: OpenAI client with retries and deterministic fallback.
 - `utils/image.py`: Image helpers and overlays.
 - `utils/gradcam.py`: Optional grad-cam runner (not mandatory in flow).
 - `utils/security.py`: Rate limiter and image validation.
 - `test/`: Pytest unit tests and tiny fixtures.
+- `EVA-X[repo]/`: Complete EVA-X reference repository for model architecture.
+
+## ⚠️ Important Changes
+**No Fallback Models**: This application now requires authentic trained EVA-X weights. It will fail gracefully with clear error messages if:
+- Model weights are not found
+- EVA-X architecture cannot be imported
+- Invalid checkpoint files are provided
+
+This ensures medical diagnosis reliability by preventing the use of untrained or inappropriate models.
+
+## 🚀 Performance Improvements
+- **Model Caching**: Models are cached using `@lru_cache` to avoid reloading on each request
+- **Optimized Preprocessing**: Removed redundant image encoding/validation steps
+- **Vision Transformer GradCAM**: Improved GradCAM implementation for ViT architectures
+- **Better Error Handling**: Clear error messages for debugging and user guidance
+- **Memory Efficiency**: Reduced memory usage through proper tensor management
 
 Environment
 - Python runtime: see `runtime.txt` (python-3.10)

@@ -32,10 +32,11 @@ DEFAULT_DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 rate_limiter = RateLimiter(max_requests=10, per_seconds=60)
 
 
-def _load_model(model_name: str, device_str: str):
+# Model is now cached automatically via @lru_cache decorator in create_model()
+def _get_model_info(model_name: str, device_str: str):
+    """Get model info with caching. Model creation is cached automatically."""
     device = device_str if device_str in ("cpu", "cuda") else DEFAULT_DEVICE
-    model, preprocess_fn, label_map = create_model(model_name=model_name, device=device)
-    return model, preprocess_fn, label_map, device
+    return model_name, device
 
 
 def process(image: Image.Image, model_name: str, device_choice: str, alpha: float) -> Tuple[Image.Image, Image.Image, List[Dict[str, Any]], str, Dict[str, Any]]:
@@ -44,39 +45,54 @@ def process(image: Image.Image, model_name: str, device_choice: str, alpha: floa
     # Rate limit
     rate_limiter.check()
 
-    # Validate file (Gradio gives PIL Image; for size/type safety we re-encode to bytes)
+    # Basic validation (no need to re-encode for validation)
     img_rgb = ensure_rgb(image)
-    with io.BytesIO() as buf:
-        img_rgb.save(buf, format="PNG")
-        image_bytes = buf.getvalue()
-    validate_image_file(image_bytes, max_bytes=10 * 1024 * 1024)
+    # Simple size check without re-encoding
+    if img_rgb.width * img_rgb.height > 10000 * 10000:  # ~100MP limit
+        raise ValueError("Image too large. Please use images smaller than 100 megapixels.")
 
-    # Load model
-    model, preprocess_fn, label_map, device = _load_model(model_name, device_choice)
+    # Get model info and create/retrieve cached model
+    actual_model_name, device = _get_model_info(model_name, device_choice)
+    
+    try:
+        # This call is cached - won't reload if same parameters
+        model, preprocess_fn, label_map = create_model(model_name=actual_model_name, device=device)
+        logger.info("Using model: %s on device: %s", actual_model_name, device)
+    except Exception as e:
+        logger.error("Failed to load model: %s", e)
+        raise RuntimeError(f"Model loading failed: {e}. Please check model path and ensure you have valid trained weights.")
 
     # Inference
-    diagnoses = analyze_image(model, preprocess_fn, img_rgb)
+    try:
+        diagnoses = analyze_image(model, preprocess_fn, img_rgb)
+    except Exception as e:
+        logger.error("Inference failed: %s", e)
+        raise RuntimeError(f"Medical image analysis failed: {e}")
 
-    # Grad-CAM
+    # Grad-CAM with improved error handling
     try:
         image_tensor = preprocess_fn(img_rgb).unsqueeze(0).to(device)
-        target_layer = getattr(model, "layers", None) or getattr(model, "block", None) or None
-        heatmap = get_gradcam_heatmap(model, target_layer, image_tensor)
+        heatmap = get_gradcam_heatmap(model, None, image_tensor)  # target_layer auto-detected
         heatmap_img, overlay_img = overlay_heatmap_on_image(img_rgb, heatmap, alpha=alpha)
     except Exception as e:
-        logger.exception("Grad-CAM generation failed, falling back to no-heatmap.")
-        heatmap_img = img_rgb
-        overlay_img = img_rgb
+        logger.warning("Grad-CAM generation failed: %s. Continuing without heatmap.", e)
+        heatmap_img = img_rgb.copy()
+        overlay_img = img_rgb.copy()
 
     # LLM explanation
     image_meta = {"width": img_rgb.width, "height": img_rgb.height}
-    explanation = generate_explanation(diagnoses, image_meta)
+    try:
+        explanation = generate_explanation(diagnoses, image_meta)
+    except Exception as e:
+        logger.warning("LLM explanation failed: %s", e)
+        explanation = "ระบบอธิบายผลไม่พร้อมใช้งานในขณะนี้ กรุณาพิจารณาผลการวิเคราะห์จากโมเดลโดยตรง"
 
     latency = time.time() - start_time
     meta = {
-        "model": model_name,
-        "device": device,
+        "model": actual_model_name,
+        "device": str(device),
         "latency_sec": round(latency, 3),
+        "num_classes": len(label_map)
     }
 
     table_rows = [[d["label"], round(float(d["confidence"]), 4), round(float(d["logit"]), 4)] for d in diagnoses]
@@ -122,15 +138,26 @@ def build_interface():
                         send_chat = gr.Button("Send")
 
         def process_with_ctx(image):
-            img_rgb, overlay_img, rows, explanation, meta = process(
-                image, MODEL_NAME, DEFAULT_DEVICE, 0.45
-            )
-            ctx = {"diagnoses": [{"label": r[0], "confidence": float(r[1]), "logit": float(r[2])} for r in rows], "meta": meta}
-            # Initialize chat with assistant's initial explanation and store context
-            initial_history = [{"role": "assistant", "content": explanation}]
-            initial_pairs = [("", explanation)]
-            state = {"history": initial_history, "context": ctx}
-            return img_rgb, overlay_img, rows, explanation, meta, state, initial_pairs
+            try:
+                img_rgb, overlay_img, rows, explanation, meta = process(
+                    image, MODEL_NAME, DEFAULT_DEVICE, 0.45
+                )
+                ctx = {"diagnoses": [{"label": r[0], "confidence": float(r[1]), "logit": float(r[2])} for r in rows], "meta": meta}
+                # Initialize chat with assistant's initial explanation and store context
+                initial_history = [{"role": "assistant", "content": explanation}]
+                initial_pairs = [("", explanation)]
+                state = {"history": initial_history, "context": ctx}
+                return img_rgb, overlay_img, rows, explanation, meta, state, initial_pairs
+            except Exception as e:
+                logger.error("Processing failed: %s", e)
+                error_msg = f"การวิเคราะห์ภาพล้มเหลว: {str(e)}"
+                # Return error state
+                error_image = Image.new('RGB', (224, 224), color=(200, 200, 200))
+                error_rows = [["Error", 0.0, 0.0]]
+                error_meta = {"error": str(e)}
+                error_state = {"history": [], "context": {}}
+                error_pairs = []
+                return error_image, error_image, error_rows, error_msg, error_meta, error_state, error_pairs
 
         analyze_btn.click(
             fn=process_with_ctx,

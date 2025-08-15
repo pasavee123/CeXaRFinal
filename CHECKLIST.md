@@ -1,12 +1,30 @@
+## Production Deployment Checklist
+
+### Prerequisites
 - [ ] runtime.txt is set to python-3.10
-- [ ] requirements installed without errors
+- [ ] requirements installed without errors (including timm==0.9.16)
 - [ ] OPENAI_API_KEY configured as environment secret (not committed)
-- [ ] App runs locally with `python app.py`
-- [ ] Uploading a sample X-ray returns predictions, Grad-CAM overlay, and Thai explanation
+- [ ] **Valid EVA-X model weights available** (HuggingFace Hub ID or local path)
+- [ ] EVA-X[repo] directory structure intact for model architecture
+
+### Testing & Validation
+- [ ] App runs locally with `python app.py` (will error without valid weights - expected)
+- [ ] Valid model checkpoint specified in CEXAR_MODEL environment variable
+- [ ] Uploading a sample X-ray returns authentic EVA-X predictions (not fallback)
+- [ ] Grad-CAM overlay works correctly with Vision Transformer architecture
+- [ ] Thai explanation generated successfully
 - [ ] No API keys printed in logs/UI
-- [ ] Tests pass: `pytest -q`
-- [ ] Space created on Hugging Face with hardware set (CPU/GPU)
-- [ ] Secrets configured in Space: OPENAI_API_KEY
-- [ ] Weights added via relative path or HF Hub ID (not committed)
-- [ ] README updated with any custom weight paths or models
+- [ ] Tests acknowledge no-fallback behavior: `pytest -q`
+
+### Deployment
+- [ ] Space created on Hugging Face with hardware set (CPU/GPU recommended)
+- [ ] Secrets configured in Space: OPENAI_API_KEY, CEXAR_MODEL
+- [ ] Model weights accessible via HuggingFace Hub ID or uploaded to Space
+- [ ] README updated with required model weights and deployment notes
+- [ ] Error handling tested (app fails gracefully without valid weights)
+
+### ⚠️ Critical Notes
+- **No Fallback Models**: App will intentionally fail without authentic EVA-X weights
+- **Medical Reliability**: Only trained models should be used for medical diagnosis
+- **Performance**: Model caching reduces inference time significantly
 

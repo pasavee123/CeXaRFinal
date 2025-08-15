@@ -6,6 +6,7 @@ import logging
 import importlib.util
 from pathlib import Path
 from typing import Callable, Dict, List, Tuple, Optional
+from functools import lru_cache
 
 import numpy as np
 import torch
@@ -14,6 +15,7 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 from huggingface_hub import hf_hub_download
+import timm
 
 try:
     from pytorch_grad_cam import GradCAM
@@ -142,115 +144,125 @@ def _download_checkpoint(model_name: str) -> Optional[str]:
             return None
 
 
-def _import_eva_x_factory() -> Optional[Callable[..., nn.Module]]:
-    """Dynamically import EVA-X classification model factory from reference repo.
-
-    Returns a callable like `eva02_small_patch16_xattn_fusedLN_SwiGLU_preln_RoPE` if available,
-    else None.
+def _register_eva_x_models() -> bool:
+    """Register EVA-X models with timm registry by importing models_eva.py.
+    
+    Returns True if successful, False otherwise.
     """
     repo_root = Path(__file__).resolve().parents[1]  # project root
     eva_cls_path = repo_root / "EVA-X[repo]" / "classification" / "models" / "models_eva.py"
     if not eva_cls_path.exists():
         logger.warning("EVA-X reference model file not found at %s", str(eva_cls_path))
-        return None
+        return False
 
     try:
-        spec = importlib.util.spec_from_file_location("eva_models_local", str(eva_cls_path))
+        spec = importlib.util.spec_from_file_location("eva_models_registry", str(eva_cls_path))
         if spec is None or spec.loader is None:
             logger.warning("Failed to load EVA-X spec from %s", str(eva_cls_path))
-            return None
+            return False
         module = importlib.util.module_from_spec(spec)
         sys.modules[spec.name] = module
         spec.loader.exec_module(module)  # type: ignore[attr-defined]
-        # Prefer small patch16 architecture used by provided checkpoints
-        factory_name = "eva02_small_patch16_xattn_fusedLN_SwiGLU_preln_RoPE"
-        if hasattr(module, factory_name):
-            return getattr(module, factory_name)
-        # Fallbacks
-        for name in (
-            "eva02_base_patch16_xattn_fusedLN_NaiveSwiGLU_subln_RoPE",
-            "eva02_tiny_patch16_xattn_fusedLN_SwiGLU_preln_RoPE",
-        ):
-            if hasattr(module, name):
-                return getattr(module, name)
-        logger.warning("No suitable EVA-X factory found in module %s", eva_cls_path.name)
-        return None
+        logger.info("Successfully registered EVA-X models with timm registry")
+        return True
     except Exception as e:
-        logger.warning("Failed to import EVA-X model due to: %s", e)
-        return None
+        logger.warning("Failed to import EVA-X models: %s", e)
+        return False
 
 
-class _FallbackClassifier(nn.Module):
-    def __init__(self, num_classes: int = 16):
-        super().__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, 3, 2, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, 3, 2, 1), nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, 3, 2, 1), nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-        )
-        self.classifier = nn.Linear(128, num_classes)
+def _get_model_name_from_path(model_path: str) -> str:
+    """Extract model architecture name from model path or use default."""
+    # Default to small model
+    default_model = "eva02_small_patch16_xattn_fusedLN_SwiGLU_preln_RoPE"
+    
+    # Try to infer from path
+    if "tiny" in model_path.lower():
+        return "eva02_tiny_patch16_xattn_fusedLN_SwiGLU_preln_RoPE"
+    elif "base" in model_path.lower():
+        return "eva02_base_patch16_xattn_fusedLN_NaiveSwiGLU_subln_RoPE"
+    elif "small" in model_path.lower():
+        return "eva02_small_patch16_xattn_fusedLN_SwiGLU_preln_RoPE"
+    
+    return default_model
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.features(x)
-        x = torch.flatten(x, 1)
-        return self.classifier(x)
+
+# Removed fallback classifier - only use real EVA-X models
 
 
+@lru_cache(maxsize=2)
 def create_model(model_name: str, device: str = "cuda") -> Tuple[nn.Module, Callable[[Image.Image], torch.Tensor], List[str]]:
+    """Create EVA-X model using timm registry - the correct EVA-X approach."""
     device_t = torch.device(device if torch.cuda.is_available() and device == "cuda" else "cpu")
-    label_map = _get_label_map_default16()
-
-    # Try to build real EVA-X model
-    model: nn.Module
+    
+    # Setup dependency stubs
     _ensure_dependency_stubs()
-    factory = _import_eva_x_factory()
-    if factory is not None:
-        try:
-            # Instantiate with neutral head; we'll reset to checkpoint classes after reading weights
-            model = factory(pretrained=False, num_classes=0)
-            logger.info("Initialized real EVA-X model via %s", factory.__name__)
-        except Exception as e:
-            logger.warning("EVA-X factory instantiation failed (%s). Falling back to small CNN.", e)
-            model = _FallbackClassifier(num_classes=len(label_map))
-    else:
-        model = _FallbackClassifier(num_classes=len(label_map))
-        logger.warning("Using fallback classifier as EVA-X import was unavailable.")
-
-    # Load checkpoint
+    
+    # Register EVA-X models with timm
+    if not _register_eva_x_models():
+        raise RuntimeError(
+            "EVA-X model registration failed. Please ensure EVA-X[repo]/classification/models/models_eva.py exists. "
+            "This medical application requires authentic EVA-X models for reliable diagnosis."
+        )
+    
+    # Download and verify checkpoint
     ckpt_path = _download_checkpoint(model_name)
-    if ckpt_path is not None and os.path.isfile(ckpt_path):
-        state = torch.load(ckpt_path, map_location=device_t)
-        # Common containers: {"model": ...}, {"state_dict": ...}
-        if isinstance(state, dict):
-            if "model" in state and isinstance(state["model"], dict):
-                state = state["model"]
-            elif "state_dict" in state and isinstance(state["state_dict"], dict):
-                state = state["state_dict"]
-        # Try inferring classifier size from checkpoint and reset head accordingly (for EVA-X VisionTransformer)
-        num_classes_from_ckpt: Optional[int] = None
-        if isinstance(state, dict):
-            hw = state.get("head.weight")
-            hb = state.get("head.bias")
-            if isinstance(hw, torch.Tensor):
-                num_classes_from_ckpt = int(hw.shape[0])
-            elif isinstance(hb, torch.Tensor):
-                num_classes_from_ckpt = int(hb.shape[0])
-        if num_classes_from_ckpt is not None and hasattr(model, "reset_classifier"):
-            try:
-                model.reset_classifier(num_classes_from_ckpt)
-                label_map = _get_label_map_by_count(num_classes_from_ckpt)
-                logger.info("Reset classifier to %d classes inferred from checkpoint.", num_classes_from_ckpt)
-            except Exception:
-                logger.warning("Failed to reset classifier to %d; continuing.", num_classes_from_ckpt)
-        try:
-            missing, unexpected = model.load_state_dict(state, strict=False)
-            logger.info("Loaded EVA-X weights: missing=%s unexpected=%s", missing, unexpected)
-        except Exception as e:
-            logger.warning("Failed to load EVA-X checkpoint (%s). Using randomly initialized weights.", e)
-    else:
-        logger.info("No checkpoint provided; using randomly initialized weights.")
-
+    if ckpt_path is None or not os.path.isfile(ckpt_path):
+        raise RuntimeError(
+            f"Model checkpoint not found: {model_name}. "
+            "Medical diagnosis requires trained weights. Please provide valid model path or HuggingFace Hub ID."
+        )
+    
+    # Load checkpoint to determine architecture and classes
+    state = torch.load(ckpt_path, map_location=device_t)
+    if isinstance(state, dict):
+        if "model" in state and isinstance(state["model"], dict):
+            state = state["model"]
+        elif "state_dict" in state and isinstance(state["state_dict"], dict):
+            state = state["state_dict"]
+    
+    # Determine number of classes from checkpoint
+    num_classes_from_ckpt: Optional[int] = None
+    if isinstance(state, dict):
+        hw = state.get("head.weight")
+        hb = state.get("head.bias")
+        if isinstance(hw, torch.Tensor):
+            num_classes_from_ckpt = int(hw.shape[0])
+        elif isinstance(hb, torch.Tensor):
+            num_classes_from_ckpt = int(hb.shape[0])
+    
+    if num_classes_from_ckpt is None:
+        raise RuntimeError("Cannot determine number of classes from checkpoint. Invalid model file.")
+    
+    # Determine model architecture from path
+    model_arch = _get_model_name_from_path(model_name)
+    
+    # Create model using timm - the correct EVA-X way
+    try:
+        model = timm.create_model(
+            model_arch,
+            pretrained=False,
+            num_classes=num_classes_from_ckpt,
+            img_size=224,
+            drop_rate=0.0,
+            drop_path_rate=0.0,
+            attn_drop_rate=0.0,
+        )
+        logger.info("Created EVA-X model (%s) with %d classes using timm", model_arch, num_classes_from_ckpt)
+    except Exception as e:
+        raise RuntimeError(f"Failed to create EVA-X model via timm: {e}")
+    
+    # Load weights
+    try:
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        logger.info("Loaded EVA-X weights: missing=%s unexpected=%s", missing, unexpected)
+        if missing:
+            logger.warning("Missing keys in checkpoint: %s", missing)
+    except Exception as e:
+        raise RuntimeError(f"Failed to load model weights: {e}")
+    
+    # Setup label mapping
+    label_map = _get_label_map_by_count(num_classes_from_ckpt)
+    
     model.eval().to(device_t)
     preprocess_fn = _get_preprocess_fn(model_name, input_size=224)
     return model, preprocess_fn, label_map
@@ -282,30 +294,70 @@ def analyze_image(model: nn.Module, preprocess_fn: Callable[[Image.Image], torch
 
 
 def get_gradcam_heatmap(model: nn.Module, target_layer, image_tensor: torch.Tensor) -> np.ndarray:
+    """Generate GradCAM heatmap for Vision Transformer models."""
     device = next(model.parameters()).device
-    # For ViT-based EVA-X, GradCAM conv target may not exist; fallback to simple input-grad saliency
+    
+    # For Vision Transformer, use attention rollout or gradient-based methods
     if GradCAM is None:
+        # Fallback: simple gradient-based saliency
         image_tensor = image_tensor.requires_grad_(True)
         scores = model(image_tensor)
-        top_idx = scores.sigmoid().mean(dim=1).argmax()
-        scores[:, top_idx].backward()
+        # Use highest confidence prediction for grad computation
+        if scores.dim() > 1:
+            top_idx = scores.sigmoid().argmax(dim=1)
+            scores = scores.gather(1, top_idx.unsqueeze(1)).squeeze()
+        scores.backward()
         grads = image_tensor.grad.detach().abs().mean(dim=1, keepdim=True)
         heatmap = grads[0, 0]
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-6)
         return heatmap.cpu().numpy()
 
-    # Try to find a conv layer; if not found, use last module
-    last_conv = None
-    for m in reversed(list(model.modules())):
-        if isinstance(m, nn.Conv2d):
-            last_conv = m
-            break
-    target_layers = [last_conv] if last_conv is not None else [list(model.children())[-1]]
-
-    with GradCAM(model=model, target_layers=target_layers, use_cuda=(device.type == "cuda")) as cam:
-        grayscale_cam = cam(input_tensor=image_tensor, targets=None)
-        heatmap = grayscale_cam[0]
+    # For EVA-X Vision Transformer, target the last attention block's norm layer
+    target_layers = []
+    
+    # Try to find appropriate layers for ViT
+    if hasattr(model, 'blocks') and len(model.blocks) > 0:
+        # Use the last transformer block's norm layer
+        last_block = model.blocks[-1]
+        if hasattr(last_block, 'norm1'):
+            target_layers = [last_block.norm1]
+        elif hasattr(last_block, 'ln_1'):
+            target_layers = [last_block.ln_1]
+        else:
+            # Fallback to the entire last block
+            target_layers = [last_block]
+    
+    # If no suitable layer found, try patch embedding
+    if not target_layers and hasattr(model, 'patch_embed'):
+        if hasattr(model.patch_embed, 'proj'):
+            target_layers = [model.patch_embed.proj]
+    
+    # Last resort: use model head
+    if not target_layers and hasattr(model, 'head'):
+        target_layers = [model.head]
+    
+    if not target_layers:
+        # Ultimate fallback
+        target_layers = [list(model.children())[-1]]
+    
+    try:
+        with GradCAM(model=model, target_layers=target_layers, use_cuda=(device.type == "cuda")) as cam:
+            grayscale_cam = cam(input_tensor=image_tensor, targets=None)
+            heatmap = grayscale_cam[0]
+            heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-6)
+            return heatmap
+    except Exception as e:
+        logger.warning("GradCAM failed with error: %s. Using gradient saliency fallback.", e)
+        # Fallback to simple gradient method
+        image_tensor = image_tensor.requires_grad_(True)
+        scores = model(image_tensor)
+        if scores.dim() > 1:
+            top_idx = scores.sigmoid().argmax(dim=1)
+            scores = scores.gather(1, top_idx.unsqueeze(1)).squeeze()
+        scores.backward()
+        grads = image_tensor.grad.detach().abs().mean(dim=1, keepdim=True)
+        heatmap = grads[0, 0]
         heatmap = (heatmap - heatmap.min()) / (heatmap.max() - heatmap.min() + 1e-6)
-        return heatmap
+        return heatmap.cpu().numpy()
 
 
